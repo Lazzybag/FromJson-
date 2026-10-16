@@ -26,10 +26,8 @@ jobs:
       - uses: actions/checkout@v4
       - id: parse
         run: |
-          # Skip comments and empty lines, keep first 4 columns
           awk '/^[[:space:]]*#/ {next} NF==0 {next} {print $1"\t"$2"\t"$3"\t"$4}' domain.txt > t.tsv
 
-          # Build compact JSON array (one object per line of domain.txt)
           JSON=$(jq -Rnc '[inputs | select(length>0) | split("\t")
             | {
                 url: .[0],
@@ -37,16 +35,17 @@ jobs:
                 native: (.[2] // ""),
                 evm: (.[3] // ""),
                 slug: (.[0] | gsub("https?://";"") | gsub("[^A-Za-z0-9]+";"-"))
-              }]')
+              }]' < t.tsv)
 
-          # CRITICAL: write multi-line / complex value with delimiter
           {
             echo "targets<<EOF"
             echo "$JSON"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-          # Optional debug
+          echo "=== targets JSON ==="
+          echo "$JSON" | jq .
+          echo "=== target list ==="
           echo "$JSON" | jq -r '.[] | "target: \(.url)"'
 
   tier1-web:
