@@ -1,0 +1,358 @@
+name: rea-bounty-recon
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_tor:
+        description: 'Route probes through Tor'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+  push:
+    paths: ['domain.txt']
+
+permissions:
+  contents: read
+
+env:
+  NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.parse.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: parse
+        run: |
+          awk '/^[[:space:]]*#/ {next} NF==0 {next} {print $1"\t"$2"\t"$3"\t"$4}' domain.txt > t.tsv
+          JSON=$(jq -Rn '[inputs | select(length>0) | split("\t")
+            | {url:.[0], apk:(.[1]//""), native:(.[2]//""), evm:(.[3]//""),
+               slug:(.[0]|gsub("https?://";"")|gsub("[^A-Za-z0-9]+";"-"))}]' < t.tsv)
+          echo "targets=$JSON" >> "$GITHUB_OUTPUT"
+          echo "$JSON" | jq -r '.[] | "target: \(.url)"'
+
+  tier1-web:
+    needs: prepare
+    if: needs.prepare.outputs.targets != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy: { fail-fast: false, matrix: { t: ${{ fromJSON(needs.prepare.outputs.targets) }} } }
+    steps:
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      - name: Tor bridge
+        if: inputs.use_tor == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y tor privoxy
+          sudo tee /etc/tor/torrc >/dev/null <<'EOF'
+          SocksPort 9050
+          CookieAuthentication 0
+          EOF
+          sudo service tor start
+          for i in $(seq 1 40); do
+            curl -s --socks5-hostname 127.0.0.1:9050 -m 10 https://check.torproject.org/api/ip | grep -q IsTor && break
+            sleep 3
+          done
+          sudo sed -i 's/^#\s*forward-socks5t.*/forward-socks5t \/ 127.0.0.1:9050 ./' /etc/privoxy/config
+          sudo service privoxy restart
+      - name: Analyze bundle
+        run: |
+          sudo apt-get update && sudo apt-get install -y util-linux jq curl
+          if [ "${{ inputs.use_tor }}" = "true" ]; then
+            export HTTP_PROXY=http://127.0.0.1:8118 HTTPS_PROXY=http://127.0.0.1:8118 NODE_USE_ENV_PROXY=1
+          fi
+          mkdir -p out
+          npx -y rea-agents@latest analyze-web-bundle "${{ matrix.t.url }}" --json > out/bundle.json || true
+          jq -c '{source:{kind:"inline",evidence:.},view:{kind:"summary"}}' out/bundle.json > out/view.json 2>/dev/null || true
+          npx -y rea-agents@latest inspect-analysis-view out/view.json > out/summary.txt || true
+      - uses: actions/upload-artifact@v4
+        with: { name: tier1-web-${{ matrix.t.slug }}, path: out }
+
+  recon:
+    needs: prepare
+    if: needs.prepare.outputs.targets != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy: { fail-fast: false, matrix: { t: ${{ fromJSON(needs.prepare.outputs.targets) }} } }
+    steps:
+      - name: Tor
+        if: inputs.use_tor == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y tor
+          sudo tee /etc/tor/torrc >/dev/null <<'EOF'
+          SocksPort 9050
+          CookieAuthentication 0
+          EOF
+          sudo service tor start
+          for i in $(seq 1 40); do
+            curl -s --socks5-hostname 127.0.0.1:9050 -m 10 https://check.torproject.org/api/ip | grep -q IsTor && break
+            sleep 3
+          done
+      - name: Probe
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq curl openssl
+          cat > probe.sh <<'SH'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          T="$1"; PASS="$2"; OUT="$3"
+          SOCKS=""; [ "$PASS" = tor ] && SOCKS="--socks5-hostname 127.0.0.1:9050"
+          mkdir -p "$OUT"; H="$OUT/h-$PASS.txt"
+
+          curl -sS $SOCKS -m 25 -D "$H" -o /dev/null -L --max-redirs 5 "$T" || true
+
+          for h in strict-transport-security content-security-policy x-frame-options \
+                   x-content-type-options referrer-policy permissions-policy \
+                   cross-origin-opener-policy cross-origin-embedder-policy; do
+            grep -qi "^$h:" "$H" && echo "PRESENT $h" || echo "MISSING $h"
+          done > "$OUT/headers-$PASS.txt"
+
+          grep -iE '^(server|x-powered-by|x-aspnet-version|x-generator|via):' "$H" > "$OUT/banners-$PASS.txt" || true
+
+          grep -i '^set-cookie:' "$H" | while read -r c; do
+            f=""; grep -qi secure <<<"$c" || f="$f NO-Secure"
+            grep -qi httponly <<<"$c" || f="$f NO-HttpOnly"
+            grep -qi samesite <<<"$c" || f="$f NO-SameSite"
+            echo "COOKIE$f :: ${c:0:110}"
+          done > "$OUT/cookies-$PASS.txt" || true
+
+          curl -sS $SOCKS -m 25 -D - -o /dev/null -H "Origin: https://evil.example" "$T" \
+            | grep -iE '^access-control-' > "$OUT/cors-$PASS.txt" || true
+
+          curl -sS $SOCKS -m 25 -X OPTIONS -D - -o /dev/null "$T" \
+            | grep -iE '^allow:|^access-control-allow-methods:' > "$OUT/methods-$PASS.txt" || true
+
+          host=$(echo "$T" | sed -E 's#https?://([^/]+).*#\1#')
+          echo | timeout 20 openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null \
+            | openssl x509 -noout -subject -issuer -dates 2>/dev/null > "$OUT/tls-$PASS.txt" || true
+
+          for p in /.well-known/security.txt /robots.txt /sitemap.xml /.git/config /.env \
+                   /package.json /manifest.json /swagger.json /openapi.json /api \
+                   /actuator/health /actuator/env /.DS_Store /server-status /phpinfo.php; do
+            code=$(curl -sS $SOCKS -m 20 -o /dev/null -w '%{http_code}' "${T%/}$p" || echo ERR)
+            [ "$code" = "200" ] && echo "EXPOSED $code $p"
+          done > "$OUT/exposed-$PASS.txt" || true
+
+          for js in $(curl -sS $SOCKS -m 25 "$T" | grep -oE '[^"'"'"']+\.js' | sort -u | head -40); do
+            case "$js" in http*) u="$js";; *) u="${T%/}/${js#/}";; esac
+            curl -sS $SOCKS -m 20 -o /dev/null -w '%{http_code}' "$u.map" | grep -q 200 \
+              && echo "SOURCE MAP $u.map"
+          done > "$OUT/sourcemaps-$PASS.txt" || true
+          SH
+          chmod +x probe.sh
+          ./probe.sh "${{ matrix.t.url }}" direct out
+          [ "${{ inputs.use_tor }}" = "true" ] && ./probe.sh "${{ matrix.t.url }}" tor out
+      - uses: actions/upload-artifact@v4
+        with: { name: recon-${{ matrix.t.slug }}, path: out }
+
+  # ---------- read-only parameter tampering ----------
+  tamper:
+    needs: [prepare, recon, tier1-web]
+    if: always() && needs.prepare.outputs.targets != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy: { fail-fast: false, matrix: { t: ${{ fromJSON(needs.prepare.outputs.targets) }} } }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: recon-${{ matrix.t.slug }}, path: in-recon }
+      - uses: actions/download-artifact@v4
+        with: { name: tier1-web-${{ matrix.t.slug }}, path: in-web }
+      - name: Tamper
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq curl
+          cat > tamper.sh <<'SH'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          T="$1"; OUT="$2"
+          mkdir -p "$OUT"
+          host=$(echo "$T" | sed -E 's#https?://([^/]+).*#\1#')
+
+          # harvest absolute + relative parameterised paths from all artifacts
+          { grep -rhoE 'https?://[^"'"'"' <>)\\,]+' in-recon in-web 2>/dev/null | sed -E 's/[.,;]+$//'
+            grep -rhoE '/[a-zA-Z0-9_/.-]+\?[a-zA-Z0-9_%&=.-]+' in-web 2>/dev/null \
+              | sed -E "s#^#${T%/}#"
+          } | sort -u | grep -F "$host" | grep '?' > "$OUT/candidates.raw" || true
+
+          # prioritise the params that matter for these bugs
+          grep -iE 'txhash|tx_hash|id|amount|address|chain|hash|token|nonce' "$OUT/candidates.raw" \
+            > "$OUT/candidates.txt" 2>/dev/null || cp "$OUT/candidates.raw" "$OUT/candidates.txt"
+          head -40 "$OUT/candidates.txt" > "$OUT/candidates.capped"
+
+          fingerprint() {
+            local m b
+            m=$(curl -sS -m 20 -o /tmp/r.$$ -w '%{http_code} %{size_download}' "$1" 2>/dev/null) || m="ERR 0"
+            b=$(sha256sum /tmp/r.$$ 2>/dev/null | cut -c1-16)
+            printf '%s %s' "$m" "$b"
+          }
+
+          mutate() {
+            local url="$1" base q
+            base="${url%%\?*}"; q="${url#*\?}"
+            local IFS='&'; local -a pairs; read -ra pairs <<< "$q"
+            for i in "${!pairs[@]}"; do
+              local k="${pairs[$i]%%=*}" v="${pairs[$i]#*=}" np
+              if [[ "$v" =~ ^[0-9]+$ ]]; then
+                for nv in $((v+1)) $((v-1)) 0 999999; do
+                  np=("${pairs[@]}"); np[$i]="$k=$nv"; echo "$base?$(IFS='&'; echo "${np[*]}")"
+                done
+              fi
+              if [[ "$v" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+                local last="${v: -1}" rep
+                [[ "$last" == "0" ]] && rep="1" || rep="0"
+                np=("${pairs[@]}"); np[$i]="$k=${v:0:-1}$rep"; echo "$base?$(IFS='&'; echo "${np[*]}")"
+              fi
+              np=("${pairs[@]}"); np[$i]="$k=";        echo "$base?$(IFS='&'; echo "${np[*]}")"
+              np=("${pairs[@]}"); np[$i]="$k[]=$v";    echo "$base?$(IFS='&'; echo "${np[*]}")"
+            done
+          }
+
+          : > "$OUT/anomalies.txt"
+          while read -r url; do
+            [ -z "$url" ] && continue
+            bfp=$(fingerprint "$url")
+            bcode=$(echo "$bfp" | awk '{print $1}'); bsize=$(echo "$bfp" | awk '{print $2}'); bhash=$(echo "$bfp" | awk '{print $3}')
+            echo "BASE [$bcode $bsize] $url" >> "$OUT/baseline.txt"
+            while read -r m; do
+              [ -z "$m" ] && continue
+              mfp=$(fingerprint "$m")
+              mcode=$(echo "$mfp" | awk '{print $1}'); msize=$(echo "$mfp" | awk '{print $2}'); mhash=$(echo "$mfp" | awk '{print $3}')
+              if [ "$mhash" != "$bhash" ] || [ "$mcode" != "$bcode" ]; then
+                printf 'ANOMALY base=[%s %s] mut=[%s %s]\n    %s\n' "$bcode" "$bsize" "$mcode" "$msize" "$m" >> "$OUT/anomalies.txt"
+              fi
+              sleep 0.15
+            done < <(mutate "$url")
+          done < "$OUT/candidates.capped"
+          echo "candidates=$(wc -l < "$OUT/candidates.capped") anomalies=$(grep -c ANOMALY "$OUT/anomalies.txt" || true)"
+          SH
+          chmod +x tamper.sh
+          ./tamper.sh "${{ matrix.t.url }}" out
+      - uses: actions/upload-artifact@v4
+        with: { name: tamper-${{ matrix.t.slug }}, path: out }
+
+  tier1-evm:
+    needs: prepare
+    if: needs.prepare.outputs.targets != '[]'
+    runs-on: ubuntu-latest
+    strategy: { fail-fast: false, matrix: { t: ${{ fromJSON(needs.prepare.outputs.targets) }} } }
+    steps:
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      - if: matrix.t.evm != ''
+        run: |
+          sudo apt-get update && sudo apt-get install -y util-linux jq curl
+          mkdir -p out && curl -sL -o /tmp/runtime.hex "${{ matrix.t.evm }}"
+          npx -y rea-agents@latest inspect-evm-interface /tmp/runtime.hex hex --json > out/interface.json || true
+      - if: matrix.t.evm != ''
+        uses: actions/upload-artifact@v4
+        with: { name: evm-${{ matrix.t.slug }}, path: out }
+
+  tier2-android:
+    needs: prepare
+    if: needs.prepare.outputs.targets != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy: { fail-fast: false, matrix: { t: ${{ fromJSON(needs.prepare.outputs.targets) }} } }
+    steps:
+      - if: matrix.t.apk != ''
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - if: matrix.t.apk != ''
+        run: |
+          sudo apt-get update && sudo apt-get install -y jadx jq curl unzip
+          mkdir -p out && curl -sL -o /tmp/t.apk "${{ matrix.t.apk }}"
+          jadx -d out/src /tmp/t.apk > out/jadx.log 2>&1 || true
+      - if: matrix.t.apk != ''
+        uses: actions/upload-artifact@v4
+        with: { name: apk-${{ matrix.t.slug }}, path: out }
+
+  tier2-native:
+    needs: prepare
+    if: needs.prepare.outputs.targets != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy: { fail-fast: false, matrix: { t: ${{ fromJSON(needs.prepare.outputs.targets) }} } }
+    steps:
+      - if: matrix.t.native != ''
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - if: matrix.t.native != ''
+        uses: jlumbroso/free-disk-space@main
+        with: { tool-cache: true, android: true, dotnet: true, haskell: true }
+      - if: matrix.t.native != ''
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq curl unzip
+          curl -sL -o /tmp/gh.zip https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3.2_build/ghidra_11.3.2_PUBLIC_20250415.zip
+          sudo unzip -q /tmp/gh.zip -d /opt
+          echo "GHIDRA_INSTALL_DIR=$(find /opt -maxdepth 1 -name 'ghidra_*' -type d | head -1)" >> "$GITHUB_ENV"
+          mkdir -p out && curl -sL -o /tmp/t.bin "${{ matrix.t.native }}"
+          npx -y rea-agents@latest doctor --provider ghidra --json > out/doctor.json || true
+          npx -y rea-agents@latest analyze /tmp/t.bin --provider ghidra --json > out/analyze.json || true
+      - if: matrix.t.native != ''
+        uses: actions/upload-artifact@v4
+        with: { name: native-${{ matrix.t.slug }}, path: out }
+
+  tier3-hopper:
+    needs: prepare
+    if: needs.prepare.outputs.targets != '[]'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    strategy: { fail-fast: false, matrix: { t: ${{ fromJSON(needs.prepare.outputs.targets) }} } }
+    steps:
+      - if: matrix.t.native != ''
+        uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      - if: matrix.t.native != ''
+        run: |
+          brew install --cask hopper-disassembler
+          mkdir -p out && curl -sL -o /tmp/t.bin "${{ matrix.t.native }}"
+          npx -y rea-agents@latest doctor --provider hopper --json > out/doctor.json || true
+          npx -y rea-agents@latest analyze /tmp/t.bin --provider hopper --json > out/analyze.json || true
+      - if: matrix.t.native != ''
+        uses: actions/upload-artifact@v4
+        with: { name: hopper-${{ matrix.t.slug }}, path: out }
+
+  diff:
+    needs: [prepare, recon]
+    if: inputs.use_tor == 'true'
+    runs-on: ubuntu-latest
+    strategy: { fail-fast: false, matrix: { t: ${{ fromJSON(needs.prepare.outputs.targets) }} } }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: recon-${{ matrix.t.slug }}, path: in }
+      - run: |
+          mkdir -p out
+          for f in headers banners cors exposed; do
+            diff -u "in/$f-direct.txt" "in/$f-tor.txt" > "out/$f.diff" 2>&1 || true
+          done
+      - uses: actions/upload-artifact@v4
+        with: { name: diff-${{ matrix.t.slug }}, path: out }
+
+  report:
+    needs: [tier1-web, recon, tamper, tier1-evm, tier2-android, tier2-native, tier3-hopper, diff]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: all }
+      - run: |
+          sudo apt-get install -y jq
+          {
+            echo "# REA bounty recon"
+            echo; echo "## Anomalies (tampered params)"
+            cat all/tamper-*/anomalies.txt 2>/dev/null || echo "none"
+            echo; echo "## Endpoints"
+            grep -rhoE 'https?://[a-zA-Z0-9./_?=&%:-]+' all 2>/dev/null | sort -u | head -300
+            echo; echo "## Signing calls (unauthorized-signing)"
+            grep -rhoE 'signTypedData|_signTypedData|eth_sign|signMessage|EIP712|domainSeparator|chainId' all 2>/dev/null | sort | uniq -c
+            echo; echo "## Deposit / credit paths (fake-deposit)"
+            grep -rhoiE 'deposit|credit|relay|withdraw|txHash|tx_hash|mint' all 2>/dev/null | sort | uniq -c | head -120
+            echo; echo "## Misconfigurations"
+            cat all/recon-*/headers-*.txt all/recon-*/exposed-*.txt all/recon-*/cors-*.txt all/recon-*/cookies-*.txt 2>/dev/null | sort -u
+            echo; echo "## Possible secrets"
+            grep -rhoE '0x[a-fA-F0-9]{64}|api[_-]?key["'"'"']?\s*[:=]\s*["'"'"'][^"'"'"']{12,}' all 2>/dev/null | sort -u | head -120
+          } > REPORT.md
+          cat REPORT.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with: { name: REPORT, path: REPORT.md }
