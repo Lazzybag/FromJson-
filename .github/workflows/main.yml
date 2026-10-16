@@ -26,17 +26,20 @@ jobs:
       - uses: actions/checkout@v4
       - id: parse
         run: |
+          # Skip comments and blank lines, keep first 4 columns
           awk '/^[[:space:]]*#/ {next} NF==0 {next} {print $1"\t"$2"\t"$3"\t"$4}' domain.txt > t.tsv
 
+          # Build compact JSON + force https:// if missing
           JSON=$(jq -Rnc '[inputs | select(length>0) | split("\t")
             | {
-                url: .[0],
+                url: (.[0] | if test("^https?://") then . else "https://" + . end),
                 apk: (.[1] // ""),
                 native: (.[2] // ""),
                 evm: (.[3] // ""),
                 slug: (.[0] | gsub("https?://";"") | gsub("[^A-Za-z0-9]+";"-"))
               }]' < t.tsv)
 
+          # Safe multi-line output
           {
             echo "targets<<EOF"
             echo "$JSON"
@@ -120,53 +123,80 @@ jobs:
           cat > probe.sh <<'SH'
           #!/usr/bin/env bash
           set -uo pipefail
-          T="$1"; PASS="$2"; OUT="$3"
-          SOCKS=""; [ "$PASS" = tor ] && SOCKS="--socks5-hostname 127.0.0.1:9050"
-          mkdir -p "$OUT"; H="$OUT/h-$PASS.txt"
+          T="$1"
+          PASS="$2"
+          OUT="$3"
 
-          curl -sS $SOCKS -m 25 -D "$H" -o /dev/null -L --max-redirs 5 "$T" || true
+          # Always ensure scheme
+          [[ "$T" =\~ ^https?:// ]] || T="https://$T"
 
+          SOCKS_ARGS=()
+          if [ "$PASS" = "tor" ]; then
+            SOCKS_ARGS=(--socks5-hostname 127.0.0.1:9050)
+          fi
+
+          mkdir -p "$OUT"
+          H="$OUT/h-$PASS.txt"
+
+          # Basic fetch
+          curl -sS "${SOCKS_ARGS[@]}" -m 25 -D "$H" -o /dev/null -L --max-redirs 5 "$T" || true
+
+          # Security headers
           for h in strict-transport-security content-security-policy x-frame-options \
                    x-content-type-options referrer-policy permissions-policy \
                    cross-origin-opener-policy cross-origin-embedder-policy; do
             grep -qi "^$h:" "$H" && echo "PRESENT $h" || echo "MISSING $h"
-          done > "$OUT/headers-$PASS.txt"
+          done > "$OUT/headers-$PASS.txt" || true
 
+          # Server banners
           grep -iE '^(server|x-powered-by|x-aspnet-version|x-generator|via):' "$H" > "$OUT/banners-$PASS.txt" || true
 
+          # Cookies
           grep -i '^set-cookie:' "$H" | while read -r c; do
-            f=""; grep -qi secure <<<"$c" || f="$f NO-Secure"
+            f=""
+            grep -qi secure   <<<"$c" || f="$f NO-Secure"
             grep -qi httponly <<<"$c" || f="$f NO-HttpOnly"
             grep -qi samesite <<<"$c" || f="$f NO-SameSite"
             echo "COOKIE$f :: ${c:0:110}"
           done > "$OUT/cookies-$PASS.txt" || true
 
-          curl -sS $SOCKS -m 25 -D - -o /dev/null -H "Origin: https://evil.example" "$T" \
+          # CORS
+          curl -sS "${SOCKS_ARGS[@]}" -m 25 -D - -o /dev/null -H "Origin: https://evil.example" "$T" \
             | grep -iE '^access-control-' > "$OUT/cors-$PASS.txt" || true
 
-          curl -sS $SOCKS -m 25 -X OPTIONS -D - -o /dev/null "$T" \
+          # Allowed methods
+          curl -sS "${SOCKS_ARGS[@]}" -m 25 -X OPTIONS -D - -o /dev/null "$T" \
             | grep -iE '^allow:|^access-control-allow-methods:' > "$OUT/methods-$PASS.txt" || true
 
+          # TLS certificate info
           host=$(echo "$T" | sed -E 's#https?://([^/]+).*#\1#')
           echo | timeout 20 openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null \
             | openssl x509 -noout -subject -issuer -dates 2>/dev/null > "$OUT/tls-$PASS.txt" || true
 
+          # Common exposed paths
           for p in /.well-known/security.txt /robots.txt /sitemap.xml /.git/config /.env \
                    /package.json /manifest.json /swagger.json /openapi.json /api \
                    /actuator/health /actuator/env /.DS_Store /server-status /phpinfo.php; do
-            code=$(curl -sS \( SOCKS -m 20 -o /dev/null -w '%{http_code}' " \){T%/}$p" || echo ERR)
+            code=\( (curl -sS " \){SOCKS_ARGS[@]}" -m 20 -o /dev/null -w '%{http_code}' "${T%/}$p" || echo ERR)
             [ "$code" = "200" ] && echo "EXPOSED $code $p"
           done > "$OUT/exposed-$PASS.txt" || true
 
-          for js in $(curl -sS $SOCKS -m 25 "$T" | grep -oE '[^"'"'"']+\.js' | sort -u | head -40); do
-            case "$js" in http*) u="\( js";; *) u=" \){T%/}/${js#/}";; esac
-            curl -sS $SOCKS -m 20 -o /dev/null -w '%{http_code}' "$u.map" | grep -q 200 \
-              && echo "SOURCE MAP $u.map"
+          # Source maps
+          for js in \( (curl -sS " \){SOCKS_ARGS[@]}" -m 25 "$T" 2>/dev/null | grep -oE '[^"'"'"']+\.js' | sort -u | head -40); do
+            case "$js" in
+              http*) u="$js" ;;
+              *)     u="\( {T%/}/ \){js#/}" ;;
+            esac
+            code=\( (curl -sS " \){SOCKS_ARGS[@]}" -m 20 -o /dev/null -w '%{http_code}' "$u.map" || echo 000)
+            [ "$code" = "200" ] && echo "SOURCE MAP $u.map"
           done > "$OUT/sourcemaps-$PASS.txt" || true
           SH
           chmod +x probe.sh
+
           ./probe.sh "${{ matrix.t.url }}" direct out
-          [ "\( {{ inputs.use_tor }}" = "true" ] && ./probe.sh " \){{ matrix.t.url }}" tor out
+          if [ "${{ inputs.use_tor }}" = "true" ]; then
+            ./probe.sh "${{ matrix.t.url }}" tor out
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: recon-${{ matrix.t.slug }}
@@ -186,25 +216,33 @@ jobs:
         with:
           name: recon-${{ matrix.t.slug }}
           path: in-recon
+        continue-on-error: true
       - uses: actions/download-artifact@v4
         with:
           name: tier1-web-${{ matrix.t.slug }}
           path: in-web
+        continue-on-error: true
       - name: Tamper
         run: |
           sudo apt-get update && sudo apt-get install -y jq curl
           cat > tamper.sh <<'SH'
           #!/usr/bin/env bash
           set -uo pipefail
-          T="$1"; OUT="$2"
+          T="$1"
+          OUT="$2"
           mkdir -p "$OUT"
+
+          # Ensure scheme
+          [[ "$T" =\~ ^https?:// ]] || T="https://$T"
           host=$(echo "$T" | sed -E 's#https?://([^/]+).*#\1#')
 
+          # Harvest candidate URLs
           { grep -rhoE 'https?://[^"'"'"' <>)\\,]+' in-recon in-web 2>/dev/null | sed -E 's/[.,;]+$//'
             grep -rhoE '/[a-zA-Z0-9_/.-]+\?[a-zA-Z0-9_%&=.-]+' in-web 2>/dev/null \
               | sed -E "s#^#${T%/}#"
           } | sort -u | grep -F "$host" | grep '?' > "$OUT/candidates.raw" || true
 
+          # Prioritise interesting parameters
           grep -iE 'txhash|tx_hash|id|amount|address|chain|hash|token|nonce' "$OUT/candidates.raw" \
             > "$OUT/candidates.txt" 2>/dev/null || cp "$OUT/candidates.raw" "$OUT/candidates.txt"
           head -40 "$OUT/candidates.txt" > "$OUT/candidates.capped"
@@ -241,19 +279,24 @@ jobs:
           while read -r url; do
             [ -z "$url" ] && continue
             bfp=$(fingerprint "$url")
-            bcode=$(echo "$bfp" | awk '{print $1}'); bsize=$(echo "$bfp" | awk '{print $2}'); bhash=$(echo "$bfp" | awk '{print $3}')
+            bcode=$(echo "$bfp" | awk '{print $1}')
+            bsize=$(echo "$bfp" | awk '{print $2}')
+            bhash=$(echo "$bfp" | awk '{print $3}')
             echo "BASE [$bcode $bsize] $url" >> "$OUT/baseline.txt"
             while read -r m; do
               [ -z "$m" ] && continue
               mfp=$(fingerprint "$m")
-              mcode=$(echo "$mfp" | awk '{print $1}'); msize=$(echo "$mfp" | awk '{print $2}'); mhash=$(echo "$mfp" | awk '{print $3}')
+              mcode=$(echo "$mfp" | awk '{print $1}')
+              msize=$(echo "$mfp" | awk '{print $2}')
+              mhash=$(echo "$mfp" | awk '{print $3}')
               if [ "$mhash" != "$bhash" ] || [ "$mcode" != "$bcode" ]; then
-                printf 'ANOMALY base=[%s %s] mut=[%s %s]\n    %s\n' "$bcode" "$bsize" "$mcode" "$msize" "$m" >> "$OUT/anomalies.txt"
+                printf 'ANOMALY base=[%s %s] mut=[%s %s]\n    %s\n' \
+                  "$bcode" "$bsize" "$mcode" "$msize" "$m" >> "$OUT/anomalies.txt"
               fi
               sleep 0.15
             done < <(mutate "$url")
           done < "$OUT/candidates.capped"
-          echo "candidates=$(wc -l < "\( OUT/candidates.capped") anomalies= \)(grep -c ANOMALY "$OUT/anomalies.txt" || true)"
+          echo "candidates=$(wc -l < "\( OUT/candidates.capped" 2>/dev/null || echo 0) anomalies= \)(grep -c ANOMALY "$OUT/anomalies.txt" 2>/dev/null || echo 0)"
           SH
           chmod +x tamper.sh
           ./tamper.sh "${{ matrix.t.url }}" out
