@@ -123,23 +123,28 @@ jobs:
               --include-script-sources --include-storage-keys --json > out/page.json 2> out/page.err || true
           fi
 
-          # Extract endpoints with a clean heredoc (no YAML quote issues)
-          cat > /tmp/extract.py << 'PY'
+          cat > /tmp/extract.py << 'ENDPY'
           import re, os
           urls = set()
+          patterns = [
+              r'https?://[^\s"<>\\]+\.js(?:\?[^\s"<>\\]*)?',
+              r'https?://[^\s"<>\\]+\.mjs(?:\?[^\s"<>\\]*)?',
+              r'"(/[^"]+\.js(?:\?[^"]*)?)"',
+              r"'(/[^']+\.js(?:\?[^']*)?)'",
+              r'(_next/static/[^\s"<>\\]+\.js)',
+          ]
           for root, dirs, files in os.walk("out"):
               for f in files:
                   try:
                       text = open(os.path.join(root, f), errors="ignore").read()
-                      for m in re.findall(r'https?://[^\s"'\''<>\\]+\.js[^\s"'\''<>\\]*', text):
-                          urls.add(m.rstrip(".,;)'\''"))
-                      for m in re.findall(r'/[^\s"'\''<>\\]+\.js', text):
-                          urls.add(m)
+                      for pat in patterns:
+                          for m in re.findall(pat, text):
+                              urls.add(m.rstrip(".,;)"))
                   except Exception:
                       pass
           open("out/endpoints.txt", "w").write("\n".join(sorted(urls)))
           print("endpoints:", len(urls))
-          PY
+          ENDPY
           python3 /tmp/extract.py || true
 
           kill %1 2>/dev/null || true
@@ -178,17 +183,21 @@ jobs:
           echo "$TARGET_URL" > /tmp/baseurl.txt
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-          # ---- 1. Guaranteed harvest from the existing artifact ----
-          cat > /tmp/harvest.py << 'PY'
+          # ---- 1. Guaranteed harvest from artifact ----
+          cat > /tmp/harvest.py << 'ENDPY'
           import re, os
           urls = set()
+          patterns = [
+              r'https?://[^\s"<>\\]+\.js(?:\?[^\s"<>\\]*)?',
+              r'https?://[^\s"<>\\]+\.mjs(?:\?[^\s"<>\\]*)?',
+              r'"(/[^"]+\.js(?:\?[^"]*)?)"',
+              r"'(/[^']+\.js(?:\?[^']*)?)'",
+              r'(_next/static/[^\s"<>\\]+\.js)',
+          ]
           def extract(text):
-              for m in re.findall(r'https?://[^\s"'\''<>\\]+\.js(?:\?[^\s"'\''<>\\]*)?', text):
-                  urls.add(m.rstrip(".,;)'\''"))
-              for m in re.findall(r'["\'](/[^"\']+\.js(?:\?[^"\']*)?)["\']', text):
-                  urls.add(m)
-              for m in re.findall(r'(_next/static/[^"\s'\''<>\\]+\.js)', text):
-                  urls.add('/' + m)
+              for pat in patterns:
+                  for m in re.findall(pat, text):
+                      urls.add(m.rstrip('.,;)'))
           for root, dirs, files in os.walk('in-web'):
               for f in files:
                   try:
@@ -199,28 +208,31 @@ jobs:
               extract(open('in-web/endpoints.txt', errors='ignore').read())
           open('out/scripts_raw.txt', 'w').write('\n'.join(sorted(urls)) + '\n')
           print('harvested from artifact:', len(urls))
-          PY
+          ENDPY
           python3 /tmp/harvest.py
 
-          # ---- 2. Extra curl of a few generic routes ----
+          # ---- 2. Extra curl of generic routes ----
           for r in / /en /login /register /app /trade /futures /earn /market /account /apis /convert; do
             curl -sL -m 20 -A "\( UA" " \){TARGET_URL%/}${r}" -o /tmp/pg.html </dev/null || continue
-            cat > /tmp/route_harvest.py << 'PY'
+            cat > /tmp/route_harvest.py << 'ENDPY'
           import re
           text = open('/tmp/pg.html', errors='ignore').read()
           urls = set()
-          for m in re.findall(r'https?://[^\s"'\''<>\\]+\.js(?:\?[^\s"'\''<>\\]*)?', text):
-              urls.add(m.rstrip(".,;)'\''"))
-          for m in re.findall(r'["\'](/[^"\']+\.js(?:\?[^"\']*)?)["\']', text):
-              urls.add(m)
+          for pat in [
+              r'https?://[^\s"<>\\]+\.js(?:\?[^\s"<>\\]*)?',
+              r'"(/[^"]+\.js(?:\?[^"]*)?)"',
+              r"'(/[^']+\.js(?:\?[^']*)?)'",
+          ]:
+              for m in re.findall(pat, text):
+                  urls.add(m.rstrip('.,;)'))
           open('out/scripts_raw.txt', 'a').write('\n'.join(urls) + '\n')
-          print('added', len(urls))
-          PY
+          print('route added', len(urls))
+          ENDPY
             python3 /tmp/route_harvest.py || true
           done
 
-          # ---- 3. Normalize to absolute URLs and dedupe ----
-          cat > /tmp/normalize.py << 'PY'
+          # ---- 3. Normalize to absolute URLs ----
+          cat > /tmp/normalize.py << 'ENDPY'
           base = open('/tmp/baseurl.txt').read().strip().rstrip('/')
           seen = set()
           out = []
@@ -239,14 +251,14 @@ jobs:
                   out.append(u)
           open('out/scripts.txt', 'w').write('\n'.join(out) + '\n')
           print('scripts final:', len(out))
-          for u in out[:20]:
+          for u in out[:25]:
               print(' ', u)
-          PY
+          ENDPY
           python3 /tmp/normalize.py
 
           echo "=== scripts.txt count: $(wc -l < out/scripts.txt) ==="
 
-          # ---- 4. Download (CDN is not challenged) ----
+          # ---- 4. Download ----
           i=0
           while read -r u; do
             [ -z "$u" ] && continue
