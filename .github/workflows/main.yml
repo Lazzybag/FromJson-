@@ -76,16 +76,51 @@ jobs:
           done
           sudo sed -i 's/^#\s*forward-socks5t.*/forward-socks5t \/ 127.0.0.1:9050 ./' /etc/privoxy/config
           sudo service privoxy restart
-      - name: Analyze bundle
+
+      # ========== EDIT 1: Replace old "Analyze bundle" with CDP version ==========
+      - name: Analyze bundle via CDP
         run: |
           sudo apt-get update && sudo apt-get install -y util-linux jq curl
-          if [ "${{ inputs.use_tor }}" = "true" ]; then
-            export HTTP_PROXY=http://127.0.0.1:8118 HTTPS_PROXY=http://127.0.0.1:8118 NODE_USE_ENV_PROXY=1
-          fi
           mkdir -p out
-          npx -y rea-agents@latest analyze-web-bundle "${{ matrix.t.url }}" --json > out/bundle.json || true
+
+          BROWSER=$(command -v google-chrome || command -v chromium || command -v chromium-browser)
+          echo "browser: $BROWSER"
+
+          PROXYARG=""
+          if [ "${{ inputs.use_tor }}" = "true" ]; then
+            PROXYARG="--proxy-server=http://127.0.0.1:8118"
+          fi
+
+          "$BROWSER" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
+            --remote-debugging-port=9222 --user-data-dir=/tmp/rea-profile \
+            --password-store=basic \( PROXYARG " \){{ matrix.t.url }}" \
+            > out/chrome.log 2>&1 &
+
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:9222/json/version >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+          curl -s http://127.0.0.1:9222/json/list > out/targets.json || true
+          TID=$(jq -r '[.[] | select(.type=="page")][0].id // empty' out/targets.json)
+          echo "target id: $TID"
+
+          if [ -n "$TID" ]; then
+            npx -y rea-agents@latest analyze-web-bundle http://127.0.0.1:9222 "$TID" \
+              --fetch-source-maps --json > out/bundle.json 2> out/bundle.err || true
+            npx -y rea-agents@latest inspect-web-page http://127.0.0.1:9222 "$TID" \
+              --include-script-sources --include-storage-keys --json > out/page.json 2> out/page.err || true
+          else
+            echo "no page target found" | tee out/bundle.err
+          fi
+
           jq -c '{source:{kind:"inline",evidence:.},view:{kind:"summary"}}' out/bundle.json > out/view.json 2>/dev/null || true
-          npx -y rea-agents@latest inspect-analysis-view out/view.json > out/summary.txt || true
+          npx -y rea-agents@latest inspect-analysis-view out/view.json > out/summary.txt 2>&1 || true
+          npx -y rea-agents@latest capabilities --json > out/capabilities.json 2>&1 || true
+
+          pkill -f remote-debugging-port || true
+      # ========== END EDIT 1 ==========
+
       - uses: actions/upload-artifact@v4
         with:
           name: tier1-web-${{ matrix.t.slug }}
@@ -181,6 +216,20 @@ jobs:
             fi
           done > "$OUT/exposed-$PASS.txt" || true
 
+          # ========== EDIT 2: Harvest URLs before the source-map loop ==========
+          $CURL -m 25 "$T" -o "$OUT/page-$PASS.html" || true
+          {
+            grep -oE 'https?://[^"'"'"' <>]+' "$OUT/page-$PASS.html" 2>/dev/null
+            grep -oE '/[a-zA-Z0-9_/.-]+\?[a-zA-Z0-9_%&=.-]+' "$OUT/page-\( PASS.html" 2>/dev/null | sed "s#^# \){T%/}#"
+            for js in $(grep -oE '[^"'"'"']+\.js' "$OUT/page-$PASS.html" | sort -u | head -40); do
+              case "$js" in http*) u="\( js" ;; *) u=" \){T%/}/${js#/}" ;; esac
+              $CURL -m 20 "$u" -o /tmp/j.\[ 2>/dev/null || true
+              grep -oE '"/[a-zA-Z0-9_/.-]+(\?[a-zA-Z0-9_%&=.-]+)?"' /tmp/j. \] 2>/dev/null | tr -d '"' | sed "s#^#${T%/}#"
+              grep -oE 'https?://[a-zA-Z0-9_./-]+' /tmp/j.\[ 2>/dev/null
+            done
+          } | sort -u > "$OUT/urls-$PASS.txt" || true
+          # ========== END EDIT 2 ==========
+
           for js in $($CURL -m 25 "$T" 2>/dev/null | grep -oE '[^"'"'"']+\.js' | sort -u | head -40); do
             case "$js" in
               http*) u="$js" ;;
@@ -243,10 +292,18 @@ jobs:
 
           host=$(echo "$T" | sed -E 's#https?://([^/]+).*#\1#')
 
+          # ========== EDIT 3: Improved candidate harvesting + fallback ==========
           {
-            grep -rhoE 'https?://[^"'"'"' <>)\\,]+' in-recon in-web 2>/dev/null | sed -E 's/[.,;]+$//' || true
-            grep -rhoE '/[a-zA-Z0-9_/.-]+\?[a-zA-Z0-9_%&=.-]+' in-web 2>/dev/null | sed -E "s#^#${T%/}#" || true
+            cat in-recon/urls-*.txt 2>/dev/null
+            grep -rhoE 'https?://[^"'"'"' <>)\\,]+' in-web in-recon 2>/dev/null | sed -E 's/[.,;]+$//'
+            grep -rhoE '/[a-zA-Z0-9_/.-]+\?[a-zA-Z0-9_%&=.-]+' in-web 2>/dev/null | sed -E "s#^#${T%/}#"
           } | sort -u | grep -F "$host" | grep '?' > "$OUT/candidates.raw" || true
+
+          if [ ! -s "$OUT/candidates.raw" ]; then
+            grep -rhoE '/api/[a-zA-Z0-9_/.-]+|/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+' in-web in-recon 2>/dev/null \
+              | sort -u | head -20 | sed "s#^#${T%/}#; s#\$#?id=1#" > "$OUT/candidates.raw" || true
+          fi
+          # ========== END EDIT 3 ==========
 
           grep -iE 'txhash|tx_hash|id|amount|address|chain|hash|token|nonce' "$OUT/candidates.raw" \
             > "$OUT/candidates.txt" 2>/dev/null || cp "$OUT/candidates.raw" "$OUT/candidates.txt" 2>/dev/null || true
@@ -255,8 +312,8 @@ jobs:
 
           fingerprint() {
             local m b
-            m=$(curl -sS -m 20 -o /tmp/r.\[ -w '%{http_code} %{size_download}' "$1" 2>/dev/null) || m="ERR 0"
-            b=$(sha256sum /tmp/r. \] 2>/dev/null | cut -c1-16 || echo "0000000000000000")
+            m=$(curl -sS -m 20 -o /tmp/r. \] -w '%{http_code} %{size_download}' "$1" 2>/dev/null) || m="ERR 0"
+            b=$(sha256sum /tmp/r.\[ 2>/dev/null | cut -c1-16 || echo "0000000000000000")
             printf '%s %s' "$m" "$b"
           }
 
@@ -273,14 +330,10 @@ jobs:
 
             echo "BASE [$bcode $bsize] $url" >> "$OUT/baseline.txt"
 
-            # Simple mutations
             base="${url%%\?*}"
             query="${url#*\?}"
 
-            # empty value
-            echo "\( {base}? \){query//=*/=}" | head -c 500 >> /tmp/muts.$$ || true
-
-            # just log that we tried
+            echo "\( {base}? \){query//=*/=}" | head -c 500 >> /tmp/muts. \] || true
             echo "MUTATED $url" >> "$OUT/anomalies.txt" || true
 
           done < "$OUT/candidates.capped"
