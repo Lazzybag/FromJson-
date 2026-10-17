@@ -150,7 +150,6 @@ jobs:
             npx -y rea-agents@latest analyze-javascript-application site --json > out/offline.json 2> out/offline.err || true
           fi
 
-          # Simple endpoint extraction instead of broken inspect-analysis-view
           jq -r '.. | strings' out/bundle.json 2>/dev/null | grep -E '^https?://' | sort -u > out/endpoints.txt || true
 
           kill %1 2>/dev/null || true
@@ -163,7 +162,7 @@ jobs:
           path: out
 
   # ============================================================
-  # LOGICAL MODIFICATION 1 + 2: deep-sweep (generic routes)
+  # HARVEST-FIRST deep-sweep (browser is optional enrichment)
   # ============================================================
   deep-sweep:
     needs: [prepare, tier1-web]
@@ -185,36 +184,55 @@ jobs:
           path: in-web
         continue-on-error: true
 
-      - name: Sweep routes + harvest chunks
+      - name: Harvest (guaranteed) + best-effort CDP
         run: |
           set +e
           sudo apt-get update && sudo apt-get install -y util-linux jq curl
-          mkdir -p out site
+          mkdir -p out site out/cdp
 
           TARGET_URL="${{ matrix.t.url }}"
           HOST=$(echo "$TARGET_URL" | sed -E 's#https?://([^/]+).*#\1#')
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-          BROWSER=$(command -v google-chrome || command -v chromium || command -v chromium-browser)
 
-          # Generic seed + paths discovered by REA (no brand-specific routes)
+          # ---- 1. routes: generic seed + paths REA already surfaced ----
           SEED="/ /login /register /app /dashboard /trade /swap /assets /account /market /futures /earn /convert /apis"
           DERIVED=$(jq -r '.. | strings' in-web/bundle.json 2>/dev/null \
             | grep -oE '^/[a-zA-Z0-9/_.-]{2,60}$' | sort -u | head -20)
           {
             printf '%s\n' $SEED
             echo "$DERIVED"
-          } | awk 'NF' | sort -u | head -25 > out/routes.txt
-
+          } | awk 'NF' | sort -u | head -20 > out/routes.txt
           echo "=== routes ==="
           cat out/routes.txt
 
+          # ---- 2. HARVEST FROM THE ARTIFACT WE ALREADY HAVE (cannot fail) ----
+          harvest() {
+            {
+              grep -rhoE 'https?://[^"'"'"' <>)\\,]+\.(js|mjs)' "$1" 2>/dev/null
+              grep -rhoE '"/[^"'"'"' <>)\\,]+\.(js|mjs)"' "$1" 2>/dev/null | tr -d '"'
+            } | sed -E 's/[.,;]+$//'
+          }
+          harvest in-web | sort -u > out/scripts.txt
+          echo "scripts from artifact: $(wc -l < out/scripts.txt)"
+
+          # ---- 3. curl each route HTML, harvest more ----
+          while read -r r; do
+            [ -z "$r" ] && continue
+            curl -sL -m 25 -A "\( UA" " \){TARGET_URL%/}${r}" -o /tmp/route.html </dev/null || continue
+            harvest /tmp/route.html >> out/scripts.txt
+          done < out/routes.txt
+          sort -u out/scripts.txt -o out/scripts.txt
+          echo "scripts total after route curl: $(wc -l < out/scripts.txt)"
+
+          # ---- 4. best-effort CDP pass (adds app-route chunks) ----
+          BROWSER=$(command -v google-chrome || command -v chromium || command -v chromium-browser)
           "$BROWSER" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
             --remote-debugging-port=9222 --user-data-dir=/tmp/rea-sweep \
             --password-store=basic --window-size=1920,1080 --lang=en-US \
-            --user-agent="$UA" \
-            --disable-extensions --disable-component-extensions-with-background-pages \
+            --user-agent="$UA" --disable-extensions \
+            --disable-component-extensions-with-background-pages \
             --disable-blink-features=AutomationControlled \
-            "$TARGET_URL" > out/chrome.log 2>&1 &
+            "$TARGET_URL" > out/cdp/chrome.log 2>&1 &
 
           for i in $(seq 1 40); do
             curl -s http://127.0.0.1:9222/json/version >/dev/null 2>&1 && break
@@ -225,28 +243,38 @@ jobs:
           while read -r r; do
             [ -z "$r" ] && continue
             n=$((n+1))
-            curl -s -X PUT "http://127.0.0.1:9222/json/new?\( {TARGET_URL%/} \){r}" >/dev/null || true
-            sleep 8
-            curl -s http://127.0.0.1:9222/json/list > "out/targets-${n}.json" || true
-            TID=$(jq -r --arg h "$HOST" '[.[] | select(.type=="page") | select(.url | contains(\( h))][0].id // empty' "out/targets- \){n}.json")
+            curl -s -X PUT "http://127.0.0.1:9222/json/new?\( {TARGET_URL%/} \){r}" >/dev/null </dev/null || true
+            sleep 12
+            curl -s http://127.0.0.1:9222/json/list > "out/cdp/targets-${n}.json" </dev/null || true
+
+            TID=$(jq -r --arg h "$HOST" '
+              ([.[] | select(.type=="page") | select(.url | contains($h))] | .[0].id)
+              // ([.[] | select(.type=="page") | select(.url | startswith("http"))] | .[0].id)
+              // ([.[] | select(.type=="page")] | .[0].id)
+              // empty
+            ' "out/cdp/targets-${n}.json" 2>/dev/null)
+
+            echo "route [$r] -> tid [$TID]"
             [ -z "$TID" ] && continue
-            echo "route $r -> $TID"
+
             npx -y rea-agents@latest analyze-web-bundle http://127.0.0.1:9222 "$TID" \
-              --fetch-source-maps --json > "out/bundle-\( {n}.json" 2> "out/bundle- \){n}.err" || true
+              --fetch-source-maps --json > "out/cdp/bundle-\( {n}.json" 2> "out/cdp/bundle- \){n}.err" </dev/null || true
             npx -y rea-agents@latest inspect-web-page http://127.0.0.1:9222 "$TID" \
-              --include-script-sources --include-json-body-shapes --json > "out/page-\( {n}.json" 2> "out/page- \){n}.err" || true
-            curl -s "http://127.0.0.1:9222/json/close/${TID}" >/dev/null || true
+              --include-script-sources --json > "out/cdp/page-\( {n}.json" 2> "out/cdp/page- \){n}.err" </dev/null || true
+
+            harvest "out/cdp/bundle-${n}.json" >> out/scripts.txt
+            harvest "out/cdp/page-${n}.json" >> out/scripts.txt
+
+            curl -s "http://127.0.0.1:9222/json/close/${TID}" >/dev/null </dev/null || true
           done < out/routes.txt
 
-          # Generic script harvest
-          {
-            grep -rhoE 'https?://[^"'"'"' <>]+\.js' out 2>/dev/null
-            grep -rhoE '"/[^"'"'"' <>]+\.js"' out 2>/dev/null | tr -d '"'
-            grep -rhoE '/_next/static/[^"'"'"' <>]+' out 2>/dev/null | sed "s#^#${TARGET_URL%/}#"
-          } | sed -E 's/[.,;]+$//' | sort -u > out/scripts.txt
+          kill %1 2>/dev/null || true
+          pkill -f remote-debugging-port 2>/dev/null || true
 
-          echo "scripts: $(wc -l < out/scripts.txt)"
+          sort -u out/scripts.txt -o out/scripts.txt
+          echo "scripts final: $(wc -l < out/scripts.txt)"
 
+          # ---- 5. download everything (CDN is not challenged) ----
           i=0
           while read -r u; do
             [ -z "$u" ] && continue
@@ -254,21 +282,18 @@ jobs:
               http*) ;;
               *) u="\( {TARGET_URL%/}/ \){u#/}" ;;
             esac
-            curl -sL -m 30 -A "$UA" "\( u" -o "site/ \)(printf '%04d' "$i").js" || true
+            curl -sL -m 30 -A "$UA" "\( u" -o "site/ \)(printf '%04d' "$i").js" </dev/null || true
             i=$((i+1))
-          done < out/scripts.txt
+          done < <(head -300 out/scripts.txt)
+          echo "downloaded: $(ls site 2>/dev/null | wc -l)"
 
-          npx -y rea-agents@latest analyze-javascript-application site --json > out/offline.json 2> out/offline.err || true
+          npx -y rea-agents@latest analyze-javascript-application site --json > out/offline.json 2> out/offline.err </dev/null || true
 
-          # Generic API host discovery
-          grep -rhoE 'https?://[a-z0-9.-]*(api|ws|rpc|relay)[a-z0-9.-]*\.[a-z]{2,}' out 2>/dev/null \
+          grep -rhoE 'https?://[a-z0-9.-]*(api|ws|rpc|relay)[a-z0-9.-]*\.[a-z]{2,}' site out 2>/dev/null \
             | sed -E 's#(https?://[^/]+).*#\1#' | sort -u > out/api-hosts.txt
 
           echo "=== api-hosts ==="
           cat out/api-hosts.txt || true
-
-          kill %1 2>/dev/null || true
-          pkill -f remote-debugging-port 2>/dev/null || true
           exit 0
 
       - uses: actions/upload-artifact@v4
@@ -457,9 +482,9 @@ jobs:
             grep -rhoE '/[a-zA-Z0-9_/.-]+\?[a-zA-Z0-9_%&=.-]+' in-web in-sweep 2>/dev/null | sed -E "s#^#${T%/}#"
           } | sort -u | grep -F "$host" | grep '?' > "$OUT/candidates.raw" || true
 
-          # Generic API host seeding (no hardcoded paths)
-          if [ -s in-sweep/api-hosts.txt ] || [ -s in-recon/api-hosts.txt ]; then
-            cat in-sweep/api-hosts.txt in-recon/api-hosts.txt 2>/dev/null | sort -u | while read -r h; do
+          # Generic API host seeding
+          if [ -s in-sweep/api-hosts.txt ]; then
+            cat in-sweep/api-hosts.txt 2>/dev/null | sort -u | while read -r h; do
               grep -rhoE '"/[a-zA-Z0-9/_.-]+"' in-web in-recon in-sweep 2>/dev/null | tr -d '"' \
                 | grep -E '/(api|v[0-9]+)/' | sort -u | head -15 | while read -r p; do
                   echo "\( {h} \){p}?id=1"
@@ -508,10 +533,10 @@ jobs:
           path: out
 
   # ============================================================
-  # LOGICAL MODIFICATION 2: snippets job (readable code windows)
+  # Snippets – search JS files AND JSON artifacts
   # ============================================================
   snippets:
-    needs: [deep-sweep]
+    needs: [deep-sweep, tier1-web]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -524,7 +549,14 @@ jobs:
         run: |
           set +e
           mkdir -p out
-          find all -type f \( -name '*.js' -o -name 'page-*.json' -o -name 'bundle-*.json' -o -name 'offline.json' \) -size -5M 2>/dev/null | sort -u > files.txt
+
+          find all -type f \( \
+            -name '*.js' -o \
+            -name 'page*.json' -o \
+            -name 'bundle*.json' -o \
+            -name 'offline.json' \
+          \) -size -8M 2>/dev/null | sort -u > files.txt
+
           echo "files to search: $(wc -l < files.txt)"
 
           snip() {
@@ -551,7 +583,7 @@ jobs:
           } > out/snippets.md
 
           wc -c out/snippets.md
-          head -80 out/snippets.md || true
+          head -100 out/snippets.md || true
           exit 0
 
       - uses: actions/upload-artifact@v4
@@ -724,7 +756,7 @@ jobs:
             cat all/sweep-*/api-hosts.txt 2>/dev/null | sort -u || echo "none"
             echo
             echo "## Signing code snippets"
-            head -60 all/snippets/snippets.md 2>/dev/null || echo "none"
+            head -80 all/snippets/snippets.md 2>/dev/null || echo "none"
             echo
             echo "## Deposit / credit paths"
             grep -rhoiE 'deposit|credit|relay|withdraw|txHash|tx_hash|mint' all 2>/dev/null | sort | uniq -c | head -120 || echo "none"
