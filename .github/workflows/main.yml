@@ -61,6 +61,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+
       - name: Tor bridge
         if: inputs.use_tor == 'true'
         run: |
@@ -79,6 +80,7 @@ jobs:
 
       - name: Analyze bundle via CDP
         run: |
+          set +e
           sudo apt-get update && sudo apt-get install -y util-linux jq curl
           mkdir -p out
 
@@ -90,7 +92,6 @@ jobs:
             PROXYARG="--proxy-server=http://127.0.0.1:8118"
           fi
 
-          # Start Chrome with more realistic flags
           "$BROWSER" \
             --headless=new \
             --no-sandbox \
@@ -110,7 +111,6 @@ jobs:
           CHROME_PID=$!
           echo "Chrome PID: $CHROME_PID"
 
-          # Wait for CDP to become ready
           for i in $(seq 1 40); do
             if curl -s http://127.0.0.1:9222/json/version >/dev/null 2>&1; then
               echo "CDP ready after ${i}s"
@@ -119,47 +119,49 @@ jobs:
             sleep 1
           done
 
-          # Force navigation to the target
           curl -s -X PUT "http://127.0.0.1:9222/json/new?${{ matrix.t.url }}" > out/newtab.json || true
-          sleep 8
+          sleep 10
 
-          # List all targets
           curl -s http://127.0.0.1:9222/json/list > out/targets.json || true
           echo "=== targets.json ==="
           cat out/targets.json || true
 
-          TID=\( (jq -r '[.[] | select(.type=="page" and (.url | contains("blofin") or .url == " \){{ matrix.t.url }}" or .url == "about:blank" | not))][0].id // empty' out/targets.json 2>/dev/null || true)
+          TID=$(jq -r '
+            [.[] 
+             | select(.type == "page") 
+             | select(.url | test("blofin\\.com|about:blank") | not) 
+            ][0].id // empty
+          ' out/targets.json 2>/dev/null)
 
-          # Fallback: take any page target
           if [ -z "$TID" ]; then
-            TID=$(jq -r '[.[] | select(.type=="page")][0].id // empty' out/targets.json 2>/dev/null || true)
+            TID=$(jq -r '[.[] | select(.type == "page")][0].id // empty' out/targets.json 2>/dev/null)
           fi
 
           echo "target id: $TID"
 
           if [ -n "$TID" ]; then
-            echo "Running analyze-web-bundle..."
+            echo "Running analyze-web-bundle on $TID ..."
             npx -y rea-agents@latest analyze-web-bundle http://127.0.0.1:9222 "$TID" \
               --fetch-source-maps --json > out/bundle.json 2> out/bundle.err || true
 
-            echo "Running inspect-web-page..."
+            echo "Running inspect-web-page on $TID ..."
             npx -y rea-agents@latest inspect-web-page http://127.0.0.1:9222 "$TID" \
               --include-script-sources --include-storage-keys --json > out/page.json 2> out/page.err || true
           else
-            echo "no page target found" | tee out/bundle.err
-            echo "Chrome log:" >> out/bundle.err
+            echo "no usable page target found" | tee out/bundle.err
+            echo "----- chrome.log -----" >> out/bundle.err
             cat out/chrome.log >> out/bundle.err || true
           fi
 
-          # Always produce these
           jq -c '{source:{kind:"inline",evidence:.},view:{kind:"summary"}}' out/bundle.json > out/view.json 2>/dev/null || true
           npx -y rea-agents@latest inspect-analysis-view out/view.json > out/summary.txt 2>&1 || true
           npx -y rea-agents@latest capabilities --json > out/capabilities.json 2>&1 || true
 
-          # Cleanup
           kill $CHROME_PID 2>/dev/null || true
-          pkill -f remote-debugging-port || true
-          pkill -f "rea-profile" || true
+          pkill -f remote-debugging-port 2>/dev/null || true
+          pkill -f "rea-profile" 2>/dev/null || true
+
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:
@@ -256,7 +258,6 @@ jobs:
             fi
           done > "$OUT/exposed-$PASS.txt" || true
 
-          # Harvest URLs
           $CURL -m 25 "$T" -o "$OUT/page-$PASS.html" || true
           {
             grep -oE 'https?://[^"'"'"' <>]+' "$OUT/page-$PASS.html" 2>/dev/null
