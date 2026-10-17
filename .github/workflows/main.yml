@@ -27,7 +27,6 @@ jobs:
       - id: parse
         run: |
           awk '/^[[:space:]]*#/ {next} NF==0 {next} {print $1"\t"$2"\t"$3"\t"$4}' domain.txt > t.tsv
-
           JSON=$(jq -Rnc '[inputs | select(length>0) | split("\t")
             | {
                 url: (.[0] | if test("^https?://") then . else "https://" + . end),
@@ -36,16 +35,12 @@ jobs:
                 evm: (.[3] // ""),
                 slug: (.[0] | gsub("https?://";"") | gsub("[^A-Za-z0-9]+";"-"))
               }]' < t.tsv)
-
           {
             echo "targets<<EOF"
             echo "$JSON"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-
-          echo "=== targets JSON ==="
           echo "$JSON" | jq .
-          echo "=== target list ==="
           echo "$JSON" | jq -r '.[] | "target: \(.url)"'
 
   tier1-web:
@@ -61,7 +56,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-
       - name: Tor bridge
         if: inputs.use_tor == 'true'
         run: |
@@ -77,28 +71,23 @@ jobs:
           done
           sudo sed -i 's/^#\s*forward-socks5t.*/forward-socks5t \/ 127.0.0.1:9050 ./' /etc/privoxy/config
           sudo service privoxy restart
-
       - name: Analyze bundle via CDP
         run: |
           set +e
           sudo apt-get update && sudo apt-get install -y util-linux jq curl
           mkdir -p out
-
           TARGET_URL="${{ matrix.t.url }}"
           USE_TOR="${{ inputs.use_tor }}"
-
           BROWSER=$(command -v google-chrome || command -v chromium || command -v chromium-browser)
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
           PROXYARG=""
-          if [ "$USE_TOR" = "true" ]; then
-            PROXYARG="--proxy-server=http://127.0.0.1:8118"
-          fi
+          [ "$USE_TOR" = "true" ] && PROXYARG="--proxy-server=http://127.0.0.1:8118"
 
           "$BROWSER" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
             --remote-debugging-port=9222 --user-data-dir=/tmp/rea-profile \
             --password-store=basic --window-size=1920,1080 --lang=en-US \
-            --user-agent="$UA" \
-            --disable-extensions --disable-component-extensions-with-background-pages \
+            --user-agent="$UA" --disable-extensions \
+            --disable-component-extensions-with-background-pages \
             --disable-blink-features=AutomationControlled \
             $PROXYARG "$TARGET_URL" > out/chrome.log 2>&1 &
 
@@ -110,19 +99,14 @@ jobs:
           for i in $(seq 1 12); do
             sleep 5
             curl -s http://127.0.0.1:9222/json/list > out/targets.json
-            TITLE=$(jq -r '[.[] | select(.type=="page")][0].title // ""' out/targets.json)
+            TITLE=$(jq -r '[.[]|select(.type=="page")][0].title // ""' out/targets.json)
             echo "attempt $i title=[$TITLE]"
-            case "$TITLE" in
-              *"Just a moment"*|*"moment"*) ;;
-              *) break ;;
-            esac
+            case "$TITLE" in *"Just a moment"*|*"moment"*) ;; *) break ;; esac
           done
 
           host=$(echo "$TARGET_URL" | sed -E 's#https?://([^/]+).*#\1#')
-          TID=$(jq -r --arg h "$host" '[.[] | select(.type=="page") | select(.url | contains($h))][0].id // empty' out/targets.json)
-          if [ -z "$TID" ]; then
-            TID=$(jq -r '[.[] | select(.type=="page")][0].id // empty' out/targets.json)
-          fi
+          TID=$(jq -r --arg h "$host" '[.[]|select(.type=="page")|select(.url|contains($h))][0].id // empty' out/targets.json)
+          [ -z "\( TID" ] && TID= \)(jq -r '[.[]|select(.type=="page")][0].id // empty' out/targets.json)
           echo "target id: $TID"
 
           if [ -n "$TID" ]; then
@@ -132,38 +116,29 @@ jobs:
               --include-script-sources --include-storage-keys --json > out/page.json 2> out/page.err || true
           fi
 
-          if [ "$(wc -c < out/bundle.json 2>/dev/null || echo 0)" -lt 20000 ]; then
-            echo "bundle too small -> offline fallback"
-            mkdir -p site
-            curl -sL -m 30 -A "$UA" "$TARGET_URL" -o site/index.html || true
-            grep -oE 'https?://[^"'"'"']+\.js|/[^"'"'"']+\.js' site/index.html | sort -u | head -60 > js.txt
-            i=0
-            while read -r u; do
-              [ -z "$u" ] && continue
-              case "$u" in
-                http*) ;;
-                *) u="\( {TARGET_URL%/}/ \){u#/}" ;;
-              esac
-              curl -sL -m 30 -A "$UA" "\( u" -o "site/ \)(printf '%03d' "$i").js" || true
-              i=$((i+1))
-            done < js.txt
-            npx -y rea-agents@latest analyze-javascript-application site --json > out/offline.json 2> out/offline.err || true
-          fi
-
-          jq -r '.. | strings' out/bundle.json 2>/dev/null | grep -E '^https?://' | sort -u > out/endpoints.txt || true
+          # Always extract endpoints
+          python3 -c '
+import re,sys,os
+urls=set()
+for root,dirs,files in os.walk("out"):
+  for f in files:
+    try:
+      text=open(os.path.join(root,f),errors="ignore").read()
+      urls.update(re.findall(rhttps?://[^\s"'\''<>\\]+\.js[^\s"'\''<>\\]*', text))
+      urls.update(re.findall(r"/[^\s"'\''<>\\]+\.js", text))
+    except: pass
+open("out/endpoints.txt","w").write("\n".join(sorted(urls)))
+print("endpoints:",len(urls))
+' 2>/dev/null || true
 
           kill %1 2>/dev/null || true
           pkill -f remote-debugging-port 2>/dev/null || true
           exit 0
-
       - uses: actions/upload-artifact@v4
         with:
           name: tier1-web-${{ matrix.t.slug }}
           path: out
 
-  # ============================================================
-  # HARVEST-FIRST deep-sweep (browser is optional enrichment)
-  # ============================================================
   deep-sweep:
     needs: [prepare, tier1-web]
     if: always() && needs.prepare.outputs.targets != '[]'
@@ -177,129 +152,157 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-
       - uses: actions/download-artifact@v4
         with:
           name: tier1-web-${{ matrix.t.slug }}
           path: in-web
         continue-on-error: true
-
-      - name: Harvest (guaranteed) + best-effort CDP
+      - name: Guaranteed harvest + download
         run: |
           set +e
           sudo apt-get update && sudo apt-get install -y util-linux jq curl
-          mkdir -p out site out/cdp
+          mkdir -p out site
 
           TARGET_URL="${{ matrix.t.url }}"
           HOST=$(echo "$TARGET_URL" | sed -E 's#https?://([^/]+).*#\1#')
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-          # ---- 1. routes: generic seed + paths REA already surfaced ----
-          SEED="/ /login /register /app /dashboard /trade /swap /assets /account /market /futures /earn /convert /apis"
-          DERIVED=$(jq -r '.. | strings' in-web/bundle.json 2>/dev/null \
-            | grep -oE '^/[a-zA-Z0-9/_.-]{2,60}$' | sort -u | head -20)
-          {
-            printf '%s\n' $SEED
-            echo "$DERIVED"
-          } | awk 'NF' | sort -u | head -20 > out/routes.txt
-          echo "=== routes ==="
-          cat out/routes.txt
+          # ========== GUARANTEED HARVEST (Python – handles JSON escaping) ==========
+          python3 << 'PY'
+          import re, os, sys
 
-          # ---- 2. HARVEST FROM THE ARTIFACT WE ALREADY HAVE (cannot fail) ----
-          harvest() {
-            {
-              grep -rhoE 'https?://[^"'"'"' <>)\\,]+\.(js|mjs)' "$1" 2>/dev/null
-              grep -rhoE '"/[^"'"'"' <>)\\,]+\.(js|mjs)"' "$1" 2>/dev/null | tr -d '"'
-            } | sed -E 's/[.,;]+$//'
-          }
-          harvest in-web | sort -u > out/scripts.txt
-          echo "scripts from artifact: $(wc -l < out/scripts.txt)"
+          urls = set()
 
-          # ---- 3. curl each route HTML, harvest more ----
-          while read -r r; do
-            [ -z "$r" ] && continue
-            curl -sL -m 25 -A "\( UA" " \){TARGET_URL%/}${r}" -o /tmp/route.html </dev/null || continue
-            harvest /tmp/route.html >> out/scripts.txt
-          done < out/routes.txt
-          sort -u out/scripts.txt -o out/scripts.txt
-          echo "scripts total after route curl: $(wc -l < out/scripts.txt)"
+          def extract(text):
+              # absolute JS urls
+              for m in re.findall(r'https?://[^\s"\'<>\\]+\.js(?:\?[^\s"\'<>\\]*)?', text):
+                  urls.add(m.rstrip('.,;)\''))
+              # relative /_next/ or /static/ paths
+              for m in re.findall(r'["\'](/[^"\']+\.js(?:\?[^"\']*)?)["\']', text):
+                  urls.add(m)
+              # _next/static without leading slash sometimes
+              for m in re.findall(r'(_next/static/[^"\s\'<>\\]+\.js)', text):
+                  urls.add('/' + m)
 
-          # ---- 4. best-effort CDP pass (adds app-route chunks) ----
-          BROWSER=$(command -v google-chrome || command -v chromium || command -v chromium-browser)
-          "$BROWSER" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
-            --remote-debugging-port=9222 --user-data-dir=/tmp/rea-sweep \
-            --password-store=basic --window-size=1920,1080 --lang=en-US \
-            --user-agent="$UA" --disable-extensions \
-            --disable-component-extensions-with-background-pages \
-            --disable-blink-features=AutomationControlled \
-            "$TARGET_URL" > out/cdp/chrome.log 2>&1 &
+          for root, dirs, files in os.walk('in-web'):
+              for f in files:
+                  path = os.path.join(root, f)
+                  try:
+                      with open(path, errors='ignore') as fh:
+                          extract(fh.read())
+                  except Exception:
+                      pass
 
-          for i in $(seq 1 40); do
-            curl -s http://127.0.0.1:9222/json/version >/dev/null 2>&1 && break
-            sleep 1
+          # also pull from any endpoints.txt
+          if os.path.exists('in-web/endpoints.txt'):
+              extract(open('in-web/endpoints.txt', errors='ignore').read())
+
+          with open('out/scripts_raw.txt', 'w') as out:
+              for u in sorted(urls):
+                  out.write(u + '\n')
+          print(f'harvested from artifact: {len(urls)}')
+          PY
+
+          # ========== Extra: curl homepage + a few generic routes ==========
+          SEED="/ /en /login /register /app /trade /futures /earn /market /account /apis /convert"
+          for r in $SEED; do
+            curl -sL -m 20 -A "\( UA" " \){TARGET_URL%/}${r}" -o /tmp/pg.html </dev/null || continue
+            python3 -c '
+          import re,sys
+          text=open("/tmp/pg.html",errors="ignore").read()
+          urls=set()
+          for m in re.findall(r"https?://[^\s\"'\''<>\\]+\.js(?:\?[^\s\"'\''<>\\]*)?", text):
+              urls.add(m.rstrip(".,;)'\''"))
+          for m in re.findall(r"[\"'\''](/[^\"'\'']+\.js(?:\?[^\"'\'']*)?)[\"'\'']", text):
+              urls.add(m)
+          open("out/scripts_raw.txt","a").write("\n".join(urls)+"\n")
+          print("route",sys.argv[1],"added",len(urls))
+          ' "$r" 2>/dev/null || true
           done
 
-          n=0
-          while read -r r; do
-            [ -z "$r" ] && continue
-            n=$((n+1))
-            curl -s -X PUT "http://127.0.0.1:9222/json/new?\( {TARGET_URL%/} \){r}" >/dev/null </dev/null || true
-            sleep 12
-            curl -s http://127.0.0.1:9222/json/list > "out/cdp/targets-${n}.json" </dev/null || true
+          # Normalize: turn relative paths into absolute, dedupe
+          python3 << 'PY'
+          import os
+          base = os.environ.get("TARGET_URL", "https://blofin.com").rstrip("/")
+          # read TARGET_URL from a file we write
+          PY
+          echo "$TARGET_URL" > /tmp/baseurl.txt
 
-            TID=$(jq -r --arg h "$HOST" '
-              ([.[] | select(.type=="page") | select(.url | contains($h))] | .[0].id)
-              // ([.[] | select(.type=="page") | select(.url | startswith("http"))] | .[0].id)
-              // ([.[] | select(.type=="page")] | .[0].id)
-              // empty
-            ' "out/cdp/targets-${n}.json" 2>/dev/null)
+          python3 << 'PY'
+          base = open('/tmp/baseurl.txt').read().strip().rstrip('/')
+          seen = set()
+          out = []
+          for line in open('out/scripts_raw.txt', errors='ignore'):
+              u = line.strip()
+              if not u or not u.endswith(('.js', '.mjs')) and '.js?' not in u:
+                  # keep lines that look like js
+                  if '.js' not in u:
+                      continue
+              if u.startswith('//'):
+                  u = 'https:' + u
+              elif u.startswith('/'):
+                  u = base + u
+              elif not u.startswith('http'):
+                  u = base + '/' + u.lstrip('/')
+              if u not in seen:
+                  seen.add(u)
+                  out.append(u)
+          with open('out/scripts.txt', 'w') as f:
+              f.write('\n'.join(out) + '\n')
+          print(f'scripts final: {len(out)}')
+          for u in out[:15]:
+              print(' ', u)
+          PY
 
-            echo "route [$r] -> tid [$TID]"
-            [ -z "$TID" ] && continue
+          echo "=== scripts.txt line count: $(wc -l < out/scripts.txt) ==="
 
-            npx -y rea-agents@latest analyze-web-bundle http://127.0.0.1:9222 "$TID" \
-              --fetch-source-maps --json > "out/cdp/bundle-\( {n}.json" 2> "out/cdp/bundle- \){n}.err" </dev/null || true
-            npx -y rea-agents@latest inspect-web-page http://127.0.0.1:9222 "$TID" \
-              --include-script-sources --json > "out/cdp/page-\( {n}.json" 2> "out/cdp/page- \){n}.err" </dev/null || true
-
-            harvest "out/cdp/bundle-${n}.json" >> out/scripts.txt
-            harvest "out/cdp/page-${n}.json" >> out/scripts.txt
-
-            curl -s "http://127.0.0.1:9222/json/close/${TID}" >/dev/null </dev/null || true
-          done < out/routes.txt
-
-          kill %1 2>/dev/null || true
-          pkill -f remote-debugging-port 2>/dev/null || true
-
-          sort -u out/scripts.txt -o out/scripts.txt
-          echo "scripts final: $(wc -l < out/scripts.txt)"
-
-          # ---- 5. download everything (CDN is not challenged) ----
+          # ========== DOWNLOAD (CDN is not challenged) ==========
           i=0
           while read -r u; do
             [ -z "$u" ] && continue
-            case "$u" in
-              http*) ;;
-              *) u="\( {TARGET_URL%/}/ \){u#/}" ;;
-            esac
-            curl -sL -m 30 -A "$UA" "\( u" -o "site/ \)(printf '%04d' "$i").js" </dev/null || true
-            i=$((i+1))
-          done < <(head -300 out/scripts.txt)
-          echo "downloaded: $(ls site 2>/dev/null | wc -l)"
+            # skip obvious challenge scripts
+            case "$u" in *challenge-platform*) continue ;; esac
+            printf -v fname '%04d.js' "$i"
+            curl -sL -m 25 -A "$UA" "$u" -o "site/$fname" </dev/null || true
+            # keep only if we got real content
+            if [ -f "site/\( fname" ] && [ " \)(wc -c < site/$fname)" -gt 100 ]; then
+              i=$((i+1))
+            else
+              rm -f "site/$fname"
+            fi
+            # safety cap
+            [ "$i" -ge 250 ] && break
+          done < out/scripts.txt
 
-          npx -y rea-agents@latest analyze-javascript-application site --json > out/offline.json 2> out/offline.err </dev/null || true
+          echo "downloaded real JS files: $(ls site 2>/dev/null | wc -l)"
+          ls -la site | head -20
 
-          grep -rhoE 'https?://[a-z0-9.-]*(api|ws|rpc|relay)[a-z0-9.-]*\.[a-z]{2,}' site out 2>/dev/null \
-            | sed -E 's#(https?://[^/]+).*#\1#' | sort -u > out/api-hosts.txt
+          # ========== Offline analysis ==========
+          if [ "$(ls site 2>/dev/null | wc -l)" -gt 0 ]; then
+            npx -y rea-agents@latest analyze-javascript-application site --json > out/offline.json 2> out/offline.err </dev/null || true
+          else
+            echo "no JS files to analyze" > out/offline.err
+          fi
+
+          # ========== API host discovery ==========
+          {
+            grep -rhoE 'https?://[a-z0-9.-]*(api|ws|rpc|relay)[a-z0-9.-]*\.[a-z]{2,}' site out in-web 2>/dev/null
+            grep -rhoE 'https?://[a-z0-9.-]+\.(blofin|binance|okx|bybit)[a-z0-9.-]*' site out in-web 2>/dev/null
+          } | sed -E 's#(https?://[^/]+).*#\1#' | sort -u > out/api-hosts.txt
 
           echo "=== api-hosts ==="
           cat out/api-hosts.txt || true
           exit 0
-
       - uses: actions/upload-artifact@v4
         with:
           name: sweep-${{ matrix.t.slug }}
           path: out
+          # also keep the downloaded JS so snippets can search them
+      - uses: actions/upload-artifact@v4
+        with:
+          name: js-site-${{ matrix.t.slug }}
+          path: site
+          if-no-files-found: ignore
 
   recon:
     needs: prepare
@@ -324,107 +327,44 @@ jobs:
             curl -s --socks5-hostname 127.0.0.1:9050 -m 10 https://check.torproject.org/api/ip | grep -q IsTor && break
             sleep 3
           done
-
       - name: Probe
         run: |
           sudo apt-get update && sudo apt-get install -y jq curl openssl
-
           cat > probe.sh << 'SCRIPT'
           #!/bin/bash
           set -uo pipefail
-
-          T="$1"
-          PASS="$2"
-          OUT="$3"
-
-          case "$T" in
-            http://*|https://*) ;;
-            *) T="https://$T" ;;
-          esac
-
+          T="$1"; PASS="$2"; OUT="$3"
+          case "$T" in http://*|https://*) ;; *) T="https://$T" ;; esac
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
-          if [ "$PASS" = "tor" ]; then
-            CURL="curl -sS -A \"$UA\" --socks5-hostname 127.0.0.1:9050"
-          else
-            CURL="curl -sS -A \"$UA\""
-          fi
-
-          mkdir -p "$OUT"
-          H="$OUT/h-$PASS.txt"
-
+          if [ "$PASS" = "tor" ]; then CURL="curl -sS -A \"$UA\" --socks5-hostname 127.0.0.1:9050"
+          else CURL="curl -sS -A \"$UA\""; fi
+          mkdir -p "$OUT"; H="$OUT/h-$PASS.txt"
           $CURL -m 25 -D "$H" -o /dev/null -L --max-redirs 5 "$T" || true
-
-          for h in strict-transport-security content-security-policy x-frame-options \
-                   x-content-type-options referrer-policy permissions-policy \
-                   cross-origin-opener-policy cross-origin-embedder-policy; do
-            if grep -qi "^$h:" "$H"; then
-              echo "PRESENT $h"
-            else
-              echo "MISSING $h"
-            fi
+          for h in strict-transport-security content-security-policy x-frame-options x-content-type-options referrer-policy permissions-policy cross-origin-opener-policy cross-origin-embedder-policy; do
+            if grep -qi "^$h:" "$H"; then echo "PRESENT $h"; else echo "MISSING $h"; fi
           done > "$OUT/headers-$PASS.txt" || true
-
           grep -iE '^(server|x-powered-by|x-aspnet-version|x-generator|via):' "$H" > "$OUT/banners-$PASS.txt" || true
-
           grep -i '^set-cookie:' "$H" | while read -r c; do
-            f=""
-            echo "$c" | grep -qi secure   || f="$f NO-Secure"
-            echo "$c" | grep -qi httponly || f="$f NO-HttpOnly"
-            echo "$c" | grep -qi samesite || f="$f NO-SameSite"
+            f=""; echo "$c" | grep -qi secure || f="$f NO-Secure"; echo "$c" | grep -qi httponly || f="$f NO-HttpOnly"; echo "$c" | grep -qi samesite || f="$f NO-SameSite"
             echo "COOKIE$f :: ${c:0:110}"
           done > "$OUT/cookies-$PASS.txt" || true
-
-          $CURL -m 25 -D - -o /dev/null -H "Origin: https://evil.example" "$T" \
-            | grep -iE '^access-control-' > "$OUT/cors-$PASS.txt" || true
-
-          $CURL -m 25 -X OPTIONS -D - -o /dev/null "$T" \
-            | grep -iE '^allow:|^access-control-allow-methods:' > "$OUT/methods-$PASS.txt" || true
-
+          $CURL -m 25 -D - -o /dev/null -H "Origin: https://evil.example" "$T" | grep -iE '^access-control-' > "$OUT/cors-$PASS.txt" || true
+          $CURL -m 25 -X OPTIONS -D - -o /dev/null "$T" | grep -iE '^allow:|^access-control-allow-methods:' > "$OUT/methods-$PASS.txt" || true
           host=$(echo "$T" | sed -E 's#https?://([^/]+).*#\1#')
-          echo | timeout 20 openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null \
-            | openssl x509 -noout -subject -issuer -dates 2>/dev/null > "$OUT/tls-$PASS.txt" || true
-
-          for p in /.well-known/security.txt /robots.txt /sitemap.xml /.git/config /.env \
-                   /package.json /manifest.json /swagger.json /openapi.json /api \
-                   /actuator/health /actuator/env /.DS_Store /server-status /phpinfo.php; do
-            code=$(\( CURL -m 20 -o /dev/null -w '%{http_code}' " \){T%/}$p" || echo ERR)
-            if [ "$code" = "200" ]; then
-              echo "EXPOSED $code $p"
-            fi
+          echo | timeout 20 openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>/dev/null > "$OUT/tls-$PASS.txt" || true
+          for p in /.well-known/security.txt /robots.txt /sitemap.xml /.git/config /.env /package.json /manifest.json /swagger.json /openapi.json /api /actuator/health; do
+            code=$(\( CURL -m 15 -o /dev/null -w '%{http_code}' " \){T%/}$p" || echo ERR)
+            [ "$code" = "200" ] && echo "EXPOSED $code $p"
           done > "$OUT/exposed-$PASS.txt" || true
-
           $CURL -m 25 "$T" -o "$OUT/page-$PASS.html" || true
           {
-            grep -oE 'https?://[^"'"'"' <>]+' "$OUT/page-$PASS.html" 2>/dev/null
+            grep -oE 'https?://[^"'\'' <>]+' "$OUT/page-$PASS.html" 2>/dev/null
             grep -oE '/[a-zA-Z0-9_/.-]+\?[a-zA-Z0-9_%&=.-]+' "$OUT/page-\( PASS.html" 2>/dev/null | sed "s#^# \){T%/}#"
-            for js in $(grep -oE '[^"'"'"']+\.js' "$OUT/page-$PASS.html" | sort -u | head -40); do
-              case "$js" in http*) u="\( js" ;; *) u=" \){T%/}/${js#/}" ;; esac
-              $CURL -m 20 "$u" -o /tmp/j.\[ 2>/dev/null || true
-              grep -oE '"/[a-zA-Z0-9_/.-]+(\?[a-zA-Z0-9_%&=.-]+)?"' /tmp/j. \] 2>/dev/null | tr -d '"' | sed "s#^#${T%/}#"
-              grep -oE 'https?://[a-zA-Z0-9_./-]+' /tmp/j.\[ 2>/dev/null
-            done
           } | sort -u > "$OUT/urls-$PASS.txt" || true
-
-          for js in $($CURL -m 25 "$T" 2>/dev/null | grep -oE '[^"'"'"']+\.js' | sort -u | head -40); do
-            case "$js" in
-              http*) u="$js" ;;
-              *)     u="\( {T%/}/ \){js#/}" ;;
-            esac
-            code=$($CURL -m 20 -o /dev/null -w '%{http_code}' "$u.map" || echo 000)
-            if [ "$code" = "200" ]; then
-              echo "SOURCE MAP $u.map"
-            fi
-          done > "$OUT/sourcemaps-$PASS.txt" || true
           SCRIPT
-
           chmod +x probe.sh
           bash probe.sh "${{ matrix.t.url }}" direct out
-
-          if [ "${{ inputs.use_tor }}" = "true" ]; then
-            bash probe.sh "${{ matrix.t.url }}" tor out
-          fi
-
+          [ "\( {{ inputs.use_tor }}" = "true" ] && bash probe.sh " \){{ matrix.t.url }}" tor out
       - uses: actions/upload-artifact@v4
         with:
           name: recon-${{ matrix.t.slug }}
@@ -441,130 +381,66 @@ jobs:
         t: ${{ fromJSON(needs.prepare.outputs.targets) }}
     steps:
       - uses: actions/download-artifact@v4
-        with:
-          name: recon-${{ matrix.t.slug }}
-          path: in-recon
+        with: { name: recon-${{ matrix.t.slug }}, path: in-recon }
         continue-on-error: true
       - uses: actions/download-artifact@v4
-        with:
-          name: tier1-web-${{ matrix.t.slug }}
-          path: in-web
+        with: { name: tier1-web-${{ matrix.t.slug }}, path: in-web }
         continue-on-error: true
       - uses: actions/download-artifact@v4
-        with:
-          name: sweep-${{ matrix.t.slug }}
-          path: in-sweep
+        with: { name: sweep-${{ matrix.t.slug }}, path: in-sweep }
         continue-on-error: true
-
       - name: Tamper
         run: |
+          set +e
           sudo apt-get update && sudo apt-get install -y jq curl
-
-          cat > tamper.sh << 'SCRIPT'
-          #!/bin/bash
-          set -uo pipefail
-
-          T="$1"
-          OUT="$2"
-          mkdir -p "$OUT"
-
-          case "$T" in
-            http://*|https://*) ;;
-            *) T="https://$T" ;;
-          esac
-
+          mkdir -p out
+          T="${{ matrix.t.url }}"
           host=$(echo "$T" | sed -E 's#https?://([^/]+).*#\1#')
-
           {
             cat in-recon/urls-*.txt 2>/dev/null
             cat in-sweep/scripts.txt 2>/dev/null
-            grep -rhoE 'https?://[^"'"'"' <>)\\,]+' in-web in-recon in-sweep 2>/dev/null | sed -E 's/[.,;]+$//'
-            grep -rhoE '/[a-zA-Z0-9_/.-]+\?[a-zA-Z0-9_%&=.-]+' in-web in-sweep 2>/dev/null | sed -E "s#^#${T%/}#"
-          } | sort -u | grep -F "$host" | grep '?' > "$OUT/candidates.raw" || true
-
-          # Generic API host seeding
+            grep -rhoE 'https?://[^"'\'' <>)\\,]+' in-web in-recon in-sweep 2>/dev/null | sed -E 's/[.,;]+$//'
+          } | sort -u | grep -F "$host" | grep '?' > out/candidates.raw || true
           if [ -s in-sweep/api-hosts.txt ]; then
-            cat in-sweep/api-hosts.txt 2>/dev/null | sort -u | while read -r h; do
+            while read -r h; do
               grep -rhoE '"/[a-zA-Z0-9/_.-]+"' in-web in-recon in-sweep 2>/dev/null | tr -d '"' \
                 | grep -E '/(api|v[0-9]+)/' | sort -u | head -15 | while read -r p; do
                   echo "\( {h} \){p}?id=1"
                 done
-            done >> "$OUT/candidates.raw" 2>/dev/null || true
+            done < in-sweep/api-hosts.txt >> out/candidates.raw 2>/dev/null || true
           fi
-
-          if [ ! -s "$OUT/candidates.raw" ]; then
-            grep -rhoE '/api/[a-zA-Z0-9_/.-]+|/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+' in-web in-recon in-sweep 2>/dev/null \
-              | sort -u | head -20 | sed "s#^#${T%/}#; s#\$#?id=1#" > "$OUT/candidates.raw" || true
-          fi
-
-          grep -iE 'txhash|tx_hash|id|amount|address|chain|hash|token|nonce' "$OUT/candidates.raw" \
-            > "$OUT/candidates.txt" 2>/dev/null || cp "$OUT/candidates.raw" "$OUT/candidates.txt" 2>/dev/null || true
-
-          head -40 "$OUT/candidates.txt" > "$OUT/candidates.capped" 2>/dev/null || true
-
-          fingerprint() {
-            local m b
-            m=$(curl -sS -m 20 -o /tmp/r. \] -w '%{http_code} %{size_download}' "$1" 2>/dev/null) || m="ERR 0"
-            b=$(sha256sum /tmp/r.$$ 2>/dev/null | cut -c1-16 || echo "0000000000000000")
-            printf '%s %s' "$m" "$b"
-          }
-
-          : > "$OUT/anomalies.txt"
-          : > "$OUT/baseline.txt"
-
+          head -40 out/candidates.raw > out/candidates.capped 2>/dev/null || true
+          : > out/anomalies.txt
           while read -r url; do
             [ -z "$url" ] && continue
-            bfp=$(fingerprint "$url")
-            bcode=$(echo "$bfp" | awk '{print $1}')
-            bsize=$(echo "$bfp" | awk '{print $2}')
-            echo "BASE [$bcode $bsize] $url" >> "$OUT/baseline.txt"
-            echo "MUTATED $url" >> "$OUT/anomalies.txt" || true
-          done < "$OUT/candidates.capped"
-
-          echo "candidates=$(wc -l < "$OUT/candidates.capped" 2>/dev/null || echo 0)" >> "$OUT/anomalies.txt"
-          SCRIPT
-
-          chmod +x tamper.sh
-          bash tamper.sh "${{ matrix.t.url }}" out
-
+            echo "MUTATED $url" >> out/anomalies.txt
+          done < out/candidates.capped
+          echo "candidates=$(wc -l < out/candidates.capped 2>/dev/null || echo 0)" >> out/anomalies.txt
+          exit 0
       - uses: actions/upload-artifact@v4
         with:
           name: tamper-${{ matrix.t.slug }}
           path: out
 
-  # ============================================================
-  # Snippets – search JS files AND JSON artifacts
-  # ============================================================
   snippets:
     needs: [deep-sweep, tier1-web]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
-        with:
-          path: all
+        with: { path: all }
         continue-on-error: true
-
       - name: Extract interesting code snippets
         run: |
           set +e
           mkdir -p out
-
-          find all -type f \( \
-            -name '*.js' -o \
-            -name 'page*.json' -o \
-            -name 'bundle*.json' -o \
-            -name 'offline.json' \
-          \) -size -8M 2>/dev/null | sort -u > files.txt
-
+          find all -type f \( -name '*.js' -o -name 'page*.json' -o -name 'bundle*.json' -o -name 'offline.json' \) -size -10M 2>/dev/null | sort -u > files.txt
           echo "files to search: $(wc -l < files.txt)"
-
           snip() {
             xargs -a files.txt grep -oHE ".{0,140}($1).{0,260}" 2>/dev/null \
               | sed -E 's#all/[^/]*/##' \
-              | awk '!seen[substr($0,1,90)]++' | head -50
+              | awk '!seen[substr($0,1,90)]++' | head -60
           }
-
           {
             echo "## Signing calls"
             snip 'signTypedData|_signTypedData|personal_sign|eth_sign|signMessage'
@@ -581,11 +457,9 @@ jobs:
             echo "## API call sites"
             snip 'fetch\(|axios\.|/api/'
           } > out/snippets.md
-
           wc -c out/snippets.md
-          head -100 out/snippets.md || true
+          head -120 out/snippets.md || true
           exit 0
-
       - uses: actions/upload-artifact@v4
         with:
           name: snippets
@@ -601,8 +475,7 @@ jobs:
         t: ${{ fromJSON(needs.prepare.outputs.targets) }}
     steps:
       - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
+        with: { node-version: '24' }
       - if: matrix.t.evm != ''
         run: |
           sudo apt-get update && sudo apt-get install -y util-linux jq curl
@@ -610,9 +483,7 @@ jobs:
           npx -y rea-agents@latest inspect-evm-interface /tmp/runtime.hex hex --json > out/interface.json || true
       - if: matrix.t.evm != ''
         uses: actions/upload-artifact@v4
-        with:
-          name: evm-${{ matrix.t.slug }}
-          path: out
+        with: { name: evm-${{ matrix.t.slug }}, path: out }
 
   tier2-android:
     needs: prepare
@@ -626,9 +497,7 @@ jobs:
     steps:
       - if: matrix.t.apk != ''
         uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
+        with: { distribution: temurin, java-version: '21' }
       - if: matrix.t.apk != ''
         run: |
           sudo apt-get update && sudo apt-get install -y jadx jq curl unzip
@@ -636,9 +505,7 @@ jobs:
           jadx -d out/src /tmp/t.apk > out/jadx.log 2>&1 || true
       - if: matrix.t.apk != ''
         uses: actions/upload-artifact@v4
-        with:
-          name: apk-${{ matrix.t.slug }}
-          path: out
+        with: { name: apk-${{ matrix.t.slug }}, path: out }
 
   tier2-native:
     needs: prepare
@@ -652,16 +519,10 @@ jobs:
     steps:
       - if: matrix.t.native != ''
         uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
+        with: { distribution: temurin, java-version: '21' }
       - if: matrix.t.native != ''
         uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
+        with: { tool-cache: true, android: true, dotnet: true, haskell: true }
       - if: matrix.t.native != ''
         run: |
           sudo apt-get update && sudo apt-get install -y jq curl unzip
@@ -673,9 +534,7 @@ jobs:
           npx -y rea-agents@latest analyze /tmp/t.bin --provider ghidra --json > out/analyze.json || true
       - if: matrix.t.native != ''
         uses: actions/upload-artifact@v4
-        with:
-          name: native-${{ matrix.t.slug }}
-          path: out
+        with: { name: native-${{ matrix.t.slug }}, path: out }
 
   tier3-hopper:
     needs: prepare
@@ -690,8 +549,7 @@ jobs:
     steps:
       - if: matrix.t.native != ''
         uses: actions/setup-node@v4
-        with:
-          node-version: '24'
+        with: { node-version: '24' }
       - if: matrix.t.native != ''
         run: |
           brew install --cask hopper-disassembler
@@ -700,9 +558,7 @@ jobs:
           npx -y rea-agents@latest analyze /tmp/t.bin --provider hopper --json > out/analyze.json || true
       - if: matrix.t.native != ''
         uses: actions/upload-artifact@v4
-        with:
-          name: hopper-${{ matrix.t.slug }}
-          path: out
+        with: { name: hopper-${{ matrix.t.slug }}, path: out }
 
   diff:
     needs: [prepare, recon]
@@ -714,18 +570,14 @@ jobs:
         t: ${{ fromJSON(needs.prepare.outputs.targets) }}
     steps:
       - uses: actions/download-artifact@v4
-        with:
-          name: recon-${{ matrix.t.slug }}
-          path: in
+        with: { name: recon-${{ matrix.t.slug }}, path: in }
       - run: |
           mkdir -p out
           for f in headers banners cors exposed; do
             diff -u "in/$f-direct.txt" "in/$f-tor.txt" > "out/$f.diff" 2>&1 || true
           done
       - uses: actions/upload-artifact@v4
-        with:
-          name: diff-${{ matrix.t.slug }}
-          path: out
+        with: { name: diff-${{ matrix.t.slug }}, path: out }
 
   report:
     needs: [tier1-web, recon, tamper, deep-sweep, snippets, tier1-evm, tier2-android, tier2-native, tier3-hopper, diff]
@@ -733,10 +585,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
-        with:
-          path: all
+        with: { path: all }
         continue-on-error: true
-
       - run: |
           sudo apt-get install -y jq
           {
@@ -755,20 +605,22 @@ jobs:
             echo "## API hosts"
             cat all/sweep-*/api-hosts.txt 2>/dev/null | sort -u || echo "none"
             echo
+            echo "## Scripts harvested"
+            wc -l all/sweep-*/scripts.txt 2>/dev/null || echo "0"
+            echo
             echo "## Signing code snippets"
-            head -80 all/snippets/snippets.md 2>/dev/null || echo "none"
+            head -100 all/snippets/snippets.md 2>/dev/null || echo "none"
             echo
             echo "## Deposit / credit paths"
-            grep -rhoiE 'deposit|credit|relay|withdraw|txHash|tx_hash|mint' all 2>/dev/null | sort | uniq -c | head -120 || echo "none"
+            grep -rhoiE 'deposit|credit|relay|withdraw|txHash|tx_hash|mint' all 2>/dev/null | sort | uniq -c | head -80 || echo "none"
             echo
             echo "## Misconfigurations"
             cat all/recon-*/headers-*.txt all/recon-*/exposed-*.txt all/recon-*/cors-*.txt all/recon-*/cookies-*.txt 2>/dev/null | sort -u
             echo
             echo "## Possible secrets"
-            grep -rhoE '0x[a-fA-F0-9]{64}|api[_-]?key["'"'"']?\s*[:=]\s*["'"'"'][^"'"'"']{12,}' all 2>/dev/null | sort -u | head -120 || echo "none"
+            grep -rhoE '0x[a-fA-F0-9]{64}|api[_-]?key["'\''"]?\s*[:=]\s*["'\''][^"'\'']{12,}' all 2>/dev/null | sort -u | head -80 || echo "none"
           } > REPORT.md
           cat REPORT.md >> "$GITHUB_STEP_SUMMARY"
-
       - uses: actions/upload-artifact@v4
         with:
           name: REPORT
