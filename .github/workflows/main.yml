@@ -258,14 +258,20 @@ jobs:
 
           echo "=== scripts.txt count: $(wc -l < out/scripts.txt) ==="
 
-          # ---- 4. Download ----
+          # ---- 4. Download (instrumented) ----
           i=0
+          : > out/download.log
           while read -r u; do
             [ -z "$u" ] && continue
             case "$u" in *challenge-platform*) continue ;; esac
+
             printf -v fname '%04d.js' "$i"
-            curl -sL -m 25 -A "$UA" "\( u" -o "site/ \){fname}" </dev/null || true
-            if [ -f "site/\( {fname}" ] && [ " \)(wc -c < site/${fname})" -gt 100 ]; then
+            code=$(curl -sL -m 25 -A "\( UA" -o "site/ \){fname}" -w '%{http_code}' "$u" </dev/null || echo "000")
+            size=0
+            [ -f "site/\( {fname}" ] && size= \)(wc -c < "site/${fname}")
+            echo "$code $size $u" >> out/download.log
+
+            if [ "$code" = "200" ] && [ "$size" -gt 100 ]; then
               i=$((i + 1))
             else
               rm -f "site/${fname}"
@@ -274,7 +280,9 @@ jobs:
           done < out/scripts.txt
 
           echo "downloaded real JS files: $(ls site 2>/dev/null | wc -l)"
-          ls site 2>/dev/null | head -15
+          echo "=== download.log (first 25) ==="
+          head -25 out/download.log
+          ls -la site 2>/dev/null | head -15
 
           # ---- 5. Offline analysis ----
           if [ "$(ls site 2>/dev/null | wc -l)" -gt 0 ]; then
@@ -627,6 +635,9 @@ jobs:
             echo
             echo "## Scripts harvested"
             wc -l all/sweep-*/scripts.txt 2>/dev/null || echo "0"
+            echo
+            echo "## Download log (sample)"
+            head -20 all/sweep-*/download.log 2>/dev/null || echo "none"
             echo
             echo "## Signing code snippets"
             head -100 all/snippets/snippets.md 2>/dev/null || echo "none"
